@@ -1,0 +1,1391 @@
+import os
+import re
+import subprocess
+import sys
+import random
+import math
+import time
+from math import cos, sin, pi, sqrt
+
+
+# -----------------------------
+# User paths & settings
+# -----------------------------
+SIM_DIR = r"D:\Alaa\Omnet\omnetpp-5.2-src-windows\omnetpp-5.2\samples\LoRaSimFINAL"
+EXE_PATH = os.path.join(SIM_DIR, "LoRaSimFinal.exe")
+INI_PATH = os.path.join(SIM_DIR, "omnetpp_run.ini")
+CONFIG_NAME = "LoRaSim-MinimalTopology"
+HOSTS_FILE = os.path.join(SIM_DIR, "hosts_positions.txt")
+
+# Get output folder
+OUTPUT_DIR = (
+    sys.argv[2]
+    if len(sys.argv) > 2
+    else r"D:\Alaa\Results\GA"
+)
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+env = os.environ.copy()
+
+env["PATH"] = (
+    r"D:\Alaa\Omnet\omnetpp-5.2-src-windows\omnetpp-5.2\lib;"
+    r"D:\Alaa\Omnet\omnetpp-5.2-src-windows\omnetpp-5.2\bin;"
+    r"D:\Alaa\Omnet\omnetpp-5.2-src-windows\omnetpp-5.2\tools\win64\mingw64\bin;"
+    + env.get("PATH", "")
+)
+
+os.chdir(SIM_DIR)
+
+
+# -----------------------------
+# GA parameters
+# -----------------------------
+AREA_RADIUS = 6333.83
+AREA_RADIUS_SQUARED = AREA_RADIUS ** 2
+
+POP_SIZE = 15
+NUM_GENERATIONS = 15
+MUTATION_RATE = 0.25
+MUTATION_SCALE = AREA_RADIUS * 0.2
+
+# Get seed from command line, fallback to default 12345
+RNG_SEED = int(sys.argv[1]) if len(sys.argv) > 1 else 12345
+rand = random.Random(RNG_SEED)
+
+NUM_SERVERS_LIST = [3,4,5]
+
+
+# -----------------------------
+# FLOP COUNTER
+# -----------------------------
+#
+# Counting convention:
+#
+# +, -, *, /  -> 1 FLOP each
+#
+# Excluded:
+# - comparisons
+# - assignments
+# - integer arithmetic
+# - indexing
+# - random-number generation
+# - sorting
+# - list operations
+# - file I/O
+# - subprocess execution
+# - OMNeT++ simulation computation
+# - sin(), cos(), sqrt() themselves
+#
+# The FLOP count therefore represents the analytical
+# floating-point arithmetic workload of the GA algorithm.
+#
+# OMNeT++ is deliberately excluded.
+# -----------------------------
+
+class FLOPCounter:
+
+    def __init__(self):
+        self.total = 0
+
+        # FLOPs by component
+        self.initialization_flops = 0
+        self.coverage_flops = 0
+        self.selection_flops = 0
+        self.crossover_flops = 0
+        self.mutation_flops = 0
+        self.fitness_flops = 0
+        self.bookkeeping_flops = 0
+
+        # Actual events
+        self.distance_evaluations = 0
+        self.mutations = 0
+        self.boundary_corrections = 0
+        self.valid_evaluations = 0
+        self.invalid_evaluations = 0
+        self.termination_checks = 0
+
+    def add_initialization(self, n):
+        self.total += n
+        self.initialization_flops += n
+
+    def add_coverage(self, n):
+        self.total += n
+        self.coverage_flops += n
+
+    def add_selection(self, n):
+        self.total += n
+        self.selection_flops += n
+
+    def add_crossover(self, n):
+        self.total += n
+        self.crossover_flops += n
+
+    def add_mutation(self, n):
+        self.total += n
+        self.mutation_flops += n
+
+    def add_fitness(self, n):
+        self.total += n
+        self.fitness_flops += n
+
+    def add_bookkeeping(self, n):
+        self.total += n
+        self.bookkeeping_flops += n
+
+
+# -----------------------------
+# Random helpers
+# -----------------------------
+def sample_point_in_circle(rng, radius, flops):
+
+    r = radius * math.sqrt(rng.random())
+    theta = rng.uniform(0, 2 * pi)
+
+    x = r * cos(theta)
+    y = r * sin(theta)
+
+    # Count only:
+    # radius * sqrt(...) -> 1
+    # r * cos(theta)     -> 1
+    # r * sin(theta)     -> 1
+    flops.add_initialization(3)
+
+    return x, y
+
+
+def random_candidate(num_servers, flops):
+
+    return [
+        sample_point_in_circle(
+            rand,
+            AREA_RADIUS,
+            flops
+        )
+        for _ in range(num_servers)
+    ]
+
+
+def mutate_candidate(candidate, flops):
+
+    new = []
+
+    for (x, y) in candidate:
+
+        if rand.random() < MUTATION_RATE:
+
+            dx = rand.uniform(
+                -MUTATION_SCALE,
+                MUTATION_SCALE
+            )
+
+            dy = rand.uniform(
+                -MUTATION_SCALE,
+                MUTATION_SCALE
+            )
+
+            x += dx
+            y += dy
+
+            d2 = x * x + y * y
+
+            # x += dx
+            # y += dy
+            # x*x
+            # y*y
+            # x*x + y*y
+            # = 5 FLOPs
+            flops.add_mutation(5)
+
+            flops.mutations += 1
+
+            if d2 > AREA_RADIUS_SQUARED:
+
+                factor = (
+                    AREA_RADIUS
+                    / math.sqrt(d2)
+                )
+
+                x *= factor
+                y *= factor
+
+                # division + multiplication + multiplication
+                # = 3 FLOPs
+                flops.add_mutation(3)
+
+                flops.boundary_corrections += 1
+
+        new.append((x, y))
+
+    return new
+
+
+def crossover(p1, p2):
+
+    return [
+        p1[i]
+        if rand.random() < 0.5
+        else p2[i]
+        for i in range(len(p1))
+    ]
+
+
+# -----------------------------
+# OMNeT++ helpers
+# -----------------------------
+def write_ini_with_candidate(
+    candidate,
+    ini_template,
+    tmp_path
+):
+
+    with open(
+        ini_template,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        ini_text = f.read()
+
+    ini_text = re.sub(
+        r"# --- gateway placement "
+        r"\(auto-generated by GA\) ---"
+        r".*?"
+        r"# --------------------------------------------",
+        "",
+        ini_text,
+        flags=re.DOTALL,
+    )
+
+    block = (
+        "# --- gateway placement "
+        "(auto-generated by GA) ---\n"
+    )
+
+    block += (
+        f"LoRa.numServers = "
+        f"{len(candidate)}\n"
+    )
+
+    for i, (x, y) in enumerate(candidate):
+
+        block += (
+            f"LoRa.server[{i}].x = "
+            f"{x}m\n"
+        )
+
+        block += (
+            f"LoRa.server[{i}].y = "
+            f"{y}m\n"
+        )
+
+    block += (
+        "# --------------------------------------------\n"
+    )
+
+    ini_text = (
+        ini_text.rstrip()
+        + "\n\n"
+        + block
+    )
+
+    with open(
+        tmp_path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        f.write(ini_text)
+
+
+def run_omnet_with_ini(tmp_path):
+
+    cmd = [
+        EXE_PATH,
+        "-u",
+        "Cmdenv",
+        "-f",
+        tmp_path,
+        "-c",
+        CONFIG_NAME
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=SIM_DIR,
+    )
+
+    out, err = proc.communicate()
+
+    return proc.returncode, out, err
+
+
+# -----------------------------
+# Load hosts
+# -----------------------------
+def load_all_hosts(path):
+
+    hosts = {}
+
+    with open(path, "r") as f:
+
+        for line in f:
+
+            if not line.startswith("host["):
+                continue
+
+            idx = int(
+                line.split("host[")[1]
+                .split("]")[0]
+            )
+
+            parts = line.split()
+
+            x = float(
+                parts[1]
+                .split("=")[1]
+            )
+
+            y = float(
+                parts[2]
+                .split("=")[1]
+            )
+
+            hosts[idx] = (x, y)
+
+    return [
+        hosts[i]
+        for i in sorted(hosts.keys())
+    ]
+
+
+HOST_POINTS = load_all_hosts(HOSTS_FILE)
+
+print(
+    "Loaded hosts:",
+    len(HOST_POINTS)
+)
+
+
+# -----------------------------
+# Coverage checks
+# -----------------------------
+def covers_point(
+    candidate,
+    px,
+    py,
+    flops
+):
+
+    for (sx, sy) in candidate:
+
+        dx = sx - px
+        dy = sy - py
+
+        dx2 = dx ** 2
+        dy2 = dy ** 2
+
+        distance_squared = (
+            dx2 + dy2
+        )
+
+        # 5 floating-point operations:
+        # dx subtraction
+        # dy subtraction
+        # dx square
+        # dy square
+        # addition
+        flops.add_coverage(5)
+
+        flops.distance_evaluations += 1
+
+        if (
+            distance_squared
+            <= AREA_RADIUS_SQUARED
+        ):
+            return True
+
+    return False
+
+
+def all_hosts_covered(
+    candidate,
+    hosts,
+    flops
+):
+
+    return all(
+        covers_point(
+            candidate,
+            hx,
+            hy,
+            flops
+        )
+        for hx, hy in hosts
+    )
+
+
+# -----------------------------
+# Candidate evaluation
+# -----------------------------
+def evaluate_candidate(
+    candidate,
+    hosts,
+    flops
+):
+
+    if not all_hosts_covered(
+        candidate,
+        hosts,
+        flops
+    ):
+
+        flops.invalid_evaluations += 1
+
+        return None
+
+    flops.valid_evaluations += 1
+
+    tmp_ini = os.path.join(
+        SIM_DIR,
+        "GA_run.ini"
+    )
+
+    write_ini_with_candidate(
+        candidate,
+        INI_PATH,
+        tmp_ini
+    )
+
+    code, out, err = run_omnet_with_ini(
+        tmp_ini
+    )
+
+    sr_vals = [
+        float(x)
+        for x in re.findall(
+            r"totalSuccessRate\s*=\s*"
+            r"([0-9eE\+\-\.]+)",
+            out
+        )
+    ]
+
+    sp_vals = [
+        float(x)
+        for x in re.findall(
+            r"totalSuccessProb\s*=\s*"
+            r"([0-9eE\+\-\.]+)",
+            out
+        )
+    ]
+
+    # -------------------------------------------------
+    # Extract SF distribution per gateway
+    # -------------------------------------------------
+
+    sf_counts = {}
+
+    sf_pattern = re.compile(
+        r"Server\[(\d+)\]: "
+        r"Number of connected hosts at SF"
+        r"(7|8|9|10|11|12)\s*=\s*(\d+)"
+    )
+
+    for match in sf_pattern.finditer(out):
+
+        server_id = int(match.group(1))
+        sf = int(match.group(2))
+        count = int(match.group(3))
+
+        if server_id not in sf_counts:
+            sf_counts[server_id] = {}
+
+        sf_counts[server_id][sf] = count
+
+    # -------------------------------------------------
+    # Extract gateway connected-host counts
+    # -------------------------------------------------
+
+    gateway_hosts = {}
+
+    gateway_pattern = re.compile(
+        r"Server\[(\d+)\]: "
+        r"Number of connected hosts\s*=\s*(\d+)"
+    )
+
+    for match in gateway_pattern.finditer(out):
+
+        server_id = int(match.group(1))
+        count = int(match.group(2))
+
+        gateway_hosts[server_id] = count
+
+    # -------------------------------------------------
+    # Extract uncovered hosts
+    # -------------------------------------------------
+
+    uncovered_match = re.search(
+        r"Number of hosts not covered "
+        r"by any server:\s*(\d+)",
+        out
+    )
+
+    uncovered_hosts = (
+        int(uncovered_match.group(1))
+        if uncovered_match
+        else None
+    )
+
+    # -------------------------------------------------
+    # Extract packet collisions
+    # -------------------------------------------------
+
+    collision_patterns = [
+        r"totalCollisionCounter\s*=\s*(\d+)",
+        r"totalCollisionCount\s*=\s*(\d+)",
+        r"collisionCounter\s*=\s*(\d+)",
+        r"collisionCount\s*=\s*(\d+)",
+        r"totalCollisions\s*=\s*(\d+)",
+    ]
+
+    packet_collisions = None
+
+    for pattern in collision_patterns:
+
+        collision_match = re.search(
+            pattern,
+            out,
+            re.IGNORECASE
+        )
+
+        if collision_match:
+
+            packet_collisions = int(
+                collision_match.group(1)
+            )
+
+            break
+
+    # -------------------------------------------------
+    # Process SP / SR
+    # -------------------------------------------------
+
+    if sr_vals and sp_vals:
+
+        # Original SR extraction
+        sr = sum(sr_vals)
+
+        # Original SP extraction
+        sp = (
+            sum(sp_vals)
+            / len(sp_vals)
+        )
+
+        # FLOPs for Python-side result processing
+        sr_additions = max(
+            0,
+            len(sr_vals) - 1
+        )
+
+        sp_additions = max(
+            0,
+            len(sp_vals) - 1
+        )
+
+        # SR sum + SP sum + SP division
+        fitness_processing_flops = (
+            sr_additions
+            + sp_additions
+            + 1
+        )
+
+        flops.add_fitness(
+            fitness_processing_flops
+        )
+
+        # SP is the ONLY optimization objective
+        fit = sp
+
+        return {
+            "sr": sr,
+            "sp": sp,
+            "fit": fit,
+            "sf_counts": sf_counts,
+            "gateway_hosts": gateway_hosts,
+            "uncovered_hosts": uncovered_hosts,
+            "packet_collisions": packet_collisions
+        }
+
+    return {
+        "sr": 0,
+        "sp": 0,
+        "fit": 0,
+        "sf_counts": sf_counts,
+        "gateway_hosts": gateway_hosts,
+        "uncovered_hosts": uncovered_hosts,
+        "packet_collisions": packet_collisions
+    }
+
+
+# -----------------------------
+# MAIN GA RUN
+# -----------------------------
+for NUM_SERVERS in NUM_SERVERS_LIST:
+
+    start_time_total = time.time()
+
+    # One counter for this complete GA run
+    flops = FLOPCounter()
+
+    print(
+        f"\nRunning GA with "
+        f"NUM_SERVERS = "
+        f"{NUM_SERVERS}\n"
+    )
+
+    population = [
+        random_candidate(
+            NUM_SERVERS,
+            flops
+        )
+        for _ in range(POP_SIZE)
+    ]
+
+    best_overall = None
+
+    no_improve_count = 0
+    best_fit_so_far = None
+
+    # -------------------------------------------------
+    # Convergence recording
+    # -------------------------------------------------
+
+    convergence_invalid = []
+    convergence_average_fitness = []
+    convergence_best_fitness = []
+
+    output_file = os.path.join(
+        OUTPUT_DIR,
+        f"{NUM_SERVERS}_Servers.txt"
+    )
+
+    with open(
+        output_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        f.write(
+            f"GA Run for NUM_SERVERS = "
+            f"{NUM_SERVERS}\n"
+        )
+
+        f.write(
+            f"Random Seed: {RNG_SEED}\n"
+        )
+
+        f.write(
+            f"Start Time: "
+            f"{time.ctime()}\n\n"
+        )
+
+        # =================================================
+        # GENERATIONS
+        # =================================================
+
+        for gen in range(
+            1,
+            NUM_GENERATIONS + 1
+        ):
+
+            start_time_gen = time.time()
+
+            generation_flops_before = (
+                flops.total
+            )
+
+            f.write(
+                f"\n===== Generation {gen} =====\n"
+            )
+
+            evaluated = []
+
+            invalid_count = 0
+
+            for i, cand in enumerate(
+                population
+            ):
+
+                start_time_cand = time.time()
+
+                candidate_flops_before = (
+                    flops.total
+                )
+
+                res = evaluate_candidate(
+                    cand,
+                    HOST_POINTS,
+                    flops
+                )
+
+                elapsed_cand = (
+                    time.time()
+                    - start_time_cand
+                )
+
+                candidate_flops = (
+                    flops.total
+                    - candidate_flops_before
+                )
+
+                f.write(
+                    f"\nScenario {i + 1}:\n"
+                )
+
+                for j, (sx, sy) in enumerate(
+                    cand
+                ):
+
+                    f.write(
+                        f"  Server {j + 1}: "
+                        f"({sx:.4f}, "
+                        f"{sy:.4f})\n"
+                    )
+
+                if res is not None:
+
+                    f.write(
+                        f"  SR={res['sr']:.6f}, "
+                        f"SP={res['sp']:.6f}, "
+                        f"Fit={res['fit']:.6f}\n"
+                    )
+
+                    # -------------------------------------
+                    # SF distribution
+                    # -------------------------------------
+
+                    if res["sf_counts"]:
+
+                        f.write(
+                            "  SF distribution "
+                            "by gateway:\n"
+                        )
+
+                        for server_id in sorted(
+                            res["sf_counts"]
+                        ):
+
+                            f.write(
+                                f"    Server[{server_id}]: "
+                            )
+
+                            sf_values = []
+
+                            for sf in range(
+                                7,
+                                13
+                            ):
+
+                                count = res[
+                                    "sf_counts"
+                                ][server_id].get(
+                                    sf,
+                                    0
+                                )
+
+                                sf_values.append(
+                                    f"SF{sf}={count}"
+                                )
+
+                            f.write(
+                                ", ".join(
+                                    sf_values
+                                )
+                                + "\n"
+                            )
+
+                    # -------------------------------------
+                    # Gateway load
+                    # -------------------------------------
+
+                    if res["gateway_hosts"]:
+
+                        f.write(
+                            "  Gateway connected "
+                            "hosts:\n"
+                        )
+
+                        for server_id in sorted(
+                            res["gateway_hosts"]
+                        ):
+
+                            f.write(
+                                f"    Server[{server_id}]: "
+                                f"{res['gateway_hosts'][server_id]}\n"
+                            )
+
+                    # -------------------------------------
+                    # Packet collisions
+                    # -------------------------------------
+
+                    if (
+                        res["packet_collisions"]
+                        is not None
+                    ):
+
+                        f.write(
+                            f"  Packet collisions: "
+                            f"{res['packet_collisions']}\n"
+                        )
+
+                    # -------------------------------------
+                    # Coverage
+                    # -------------------------------------
+
+                    if (
+                        res["uncovered_hosts"]
+                        is not None
+                    ):
+
+                        f.write(
+                            f"  Uncovered hosts: "
+                            f"{res['uncovered_hosts']}\n"
+                        )
+
+                else:
+
+                    invalid_count += 1
+
+                    f.write(
+                        "  Invalid scenario.\n"
+                    )
+
+                f.write(
+                    f"  Time taken: "
+                    f"{elapsed_cand:.2f}s\n"
+                )
+
+                f.write(
+                    f"  Analytical GA FLOPs: "
+                    f"{candidate_flops}\n"
+                )
+
+                if res is not None:
+
+                    evaluated.append(
+                        (
+                            res["fit"],
+                            cand,
+                            res["sr"],
+                            res["sp"]
+                        )
+                    )
+
+                else:
+
+                    evaluated.append(
+                        (
+                            None,
+                            cand,
+                            None,
+                            None
+                        )
+                    )
+
+            # =================================================
+            # VALID SOLUTIONS
+            # =================================================
+
+            valid = [
+                e
+                for e in evaluated
+                if e[0] is not None
+            ]
+
+            # -------------------------------------------------
+            # CONVERGENCE METRICS
+            # -------------------------------------------------
+
+            convergence_invalid.append(
+                invalid_count
+            )
+
+            valid_fitness_values = [
+                e[0]
+                for e in valid
+            ]
+
+            if valid_fitness_values:
+
+                generation_best_fitness = max(
+                    valid_fitness_values
+                )
+
+                generation_average_fitness = (
+                    sum(valid_fitness_values)
+                    / len(valid_fitness_values)
+                )
+
+            else:
+
+                generation_best_fitness = 0.0
+                generation_average_fitness = 0.0
+
+            convergence_best_fitness.append(
+                generation_best_fitness
+            )
+
+            convergence_average_fitness.append(
+                generation_average_fitness
+            )
+
+            # -------------------------------------------------
+            # Write convergence data
+            # -------------------------------------------------
+
+            f.write(
+                "\n--- Generation Convergence ---\n"
+            )
+
+            f.write(
+                f"Invalid solutions: "
+                f"{invalid_count}\n"
+            )
+
+            f.write(
+                f"Average fitness: "
+                f"{generation_average_fitness:.10f}\n"
+            )
+
+            f.write(
+                f"Best fitness: "
+                f"{generation_best_fitness:.10f}\n"
+            )
+
+            # =================================================
+            # BEST SOLUTION
+            # =================================================
+
+            if valid:
+
+                (
+                    best_fit,
+                    best_cand,
+                    best_sr,
+                    best_sp
+                ) = max(
+                    valid,
+                    key=lambda x: x[0]
+                )
+
+                # -------------------------------------------------
+                # ALWAYS update global best independently
+                # from termination condition.
+                # -------------------------------------------------
+
+                if (
+                    best_overall is None
+                    or best_fit > best_overall[0]
+                ):
+
+                    best_overall = (
+                        best_fit,
+                        best_cand,
+                        best_sr,
+                        best_sp
+                    )
+
+                # -------------------------------------------------
+                # Termination improvement check
+                # -------------------------------------------------
+
+                improvement_threshold = 0.005
+
+                if best_fit_so_far is None:
+
+                    best_fit_so_far = best_fit
+                    no_improve_count = 0
+
+                elif (
+                    best_fit
+                    > best_fit_so_far
+                    * (1 + improvement_threshold)
+                ):
+
+                    # Count:
+                    # 1 + improvement_threshold -> 1 FLOP
+                    # best_fit_so_far * (...) -> 1 FLOP
+                    flops.add_bookkeeping(2)
+
+                    flops.termination_checks += 1
+
+                    best_fit_so_far = best_fit
+                    no_improve_count = 0
+
+                else:
+
+                    flops.add_bookkeeping(2)
+
+                    flops.termination_checks += 1
+
+                    no_improve_count += 1
+
+            else:
+
+                f.write(
+                    "No valid scenarios "
+                    "in this generation.\n"
+                )
+
+            # =================================================
+            # GENERATION FLOPs
+            # =================================================
+
+            generation_flops = (
+                flops.total
+                - generation_flops_before
+            )
+
+            # =================================================
+            # TERMINATION
+            # =================================================
+
+            if no_improve_count >= 5:
+
+                f.write(
+                    "\nTermination: "
+                    "No improvement >0.5% "
+                    "in fit for 5 consecutive "
+                    "generations.\n"
+                )
+
+                # Do not generate another population
+                break
+
+            # =================================================
+            # SELECTION
+            # =================================================
+
+            parents = [
+                c
+                for _, c, _, _
+                in sorted(
+                    valid,
+                    key=lambda x: x[0],
+                    reverse=True
+                )[
+                    :max(
+                        1,
+                        len(valid) // 2
+                    )
+                ]
+            ]
+
+            new_pop = parents.copy()
+
+            # =================================================
+            # REPRODUCTION
+            # =================================================
+
+            while len(new_pop) < POP_SIZE:
+
+                if parents:
+
+                    child = crossover(
+                        random.choice(parents),
+                        random.choice(parents)
+                    )
+
+                    child = mutate_candidate(
+                        child,
+                        flops
+                    )
+
+                else:
+
+                    child = random_candidate(
+                        NUM_SERVERS,
+                        flops
+                    )
+
+                new_pop.append(child)
+
+            population = new_pop
+
+            elapsed_gen = (
+                time.time()
+                - start_time_gen
+            )
+
+            f.write(
+                f"Time for Generation "
+                f"{gen}: "
+                f"{elapsed_gen:.2f}s\n"
+            )
+
+            f.write(
+                f"Analytical FLOPs for "
+                f"Generation {gen}: "
+                f"{generation_flops}\n"
+            )
+
+        # =====================================================
+        # TOTAL RUNTIME
+        # =====================================================
+
+        elapsed_total = (
+            time.time()
+            - start_time_total
+        )
+
+        # =====================================================
+        # FINAL CONVERGENCE DATA
+        # =====================================================
+
+        f.write(
+            "\n=============================\n"
+        )
+
+        f.write(
+            "CONVERGENCE DATA\n"
+        )
+
+        f.write(
+            "=============================\n"
+        )
+
+        f.write(
+            "Generation,InvalidSolutions,"
+            "AverageFitness,BestFitness\n"
+        )
+
+        for i in range(
+            len(convergence_invalid)
+        ):
+
+            f.write(
+                f"{i + 1},"
+                f"{convergence_invalid[i]},"
+                f"{convergence_average_fitness[i]:.10f},"
+                f"{convergence_best_fitness[i]:.10f}\n"
+            )
+
+        # =====================================================
+        # BEST OVERALL
+        # =====================================================
+
+        if best_overall:
+
+            fit, cand, sr, sp = best_overall
+
+            f.write(
+                "\n=============================\n"
+            )
+
+            f.write(
+                "BEST OVERALL SOLUTION\n"
+            )
+
+            f.write(
+                f"Fit (SP): {fit:.6f}, "
+                f"SR: {sr:.6f}, "
+                f"SP: {sp:.6f}\n"
+            )
+
+            f.write(
+                "Server positions:\n"
+            )
+
+            for j, (sx, sy) in enumerate(
+                cand
+            ):
+
+                f.write(
+                    f"  Server {j + 1}: "
+                    f"({sx:.4f}, "
+                    f"{sy:.4f})\n"
+                )
+
+        else:
+
+            f.write(
+                "\nNo valid solution found.\n"
+            )
+
+        # =====================================================
+        # FLOP BREAKDOWN
+        # =====================================================
+
+        f.write(
+            "\n=============================\n"
+        )
+
+        f.write(
+            "ANALYTICAL FLOP BREAKDOWN\n"
+        )
+
+        f.write(
+            "=============================\n"
+        )
+
+        f.write(
+            f"Initialization FLOPs: "
+            f"{flops.initialization_flops}\n"
+        )
+
+        f.write(
+            f"Coverage FLOPs: "
+            f"{flops.coverage_flops}\n"
+        )
+
+        f.write(
+            f"Selection FLOPs: "
+            f"{flops.selection_flops}\n"
+        )
+
+        f.write(
+            f"Crossover FLOPs: "
+            f"{flops.crossover_flops}\n"
+        )
+
+        f.write(
+            f"Mutation FLOPs: "
+            f"{flops.mutation_flops}\n"
+        )
+
+        f.write(
+            f"Fitness-processing FLOPs: "
+            f"{flops.fitness_flops}\n"
+        )
+
+        f.write(
+            f"Bookkeeping/termination FLOPs: "
+            f"{flops.bookkeeping_flops}\n"
+        )
+
+        f.write(
+            f"TOTAL GA FLOPs: "
+            f"{flops.total}\n"
+        )
+
+        # =====================================================
+        # FLOP EVENT STATISTICS
+        # =====================================================
+
+        f.write(
+            "\n=============================\n"
+        )
+
+        f.write(
+            "FLOP EVENT STATISTICS\n"
+        )
+
+        f.write(
+            "=============================\n"
+        )
+
+        f.write(
+            f"Distance evaluations: "
+            f"{flops.distance_evaluations}\n"
+        )
+
+        f.write(
+            f"Mutation events: "
+            f"{flops.mutations}\n"
+        )
+
+        f.write(
+            f"Boundary corrections: "
+            f"{flops.boundary_corrections}\n"
+        )
+
+        f.write(
+            f"Valid evaluations: "
+            f"{flops.valid_evaluations}\n"
+        )
+
+        f.write(
+            f"Invalid evaluations: "
+            f"{flops.invalid_evaluations}\n"
+        )
+
+        f.write(
+            f"Termination checks: "
+            f"{flops.termination_checks}\n"
+        )
+
+        # =====================================================
+        # RUNTIME
+        # =====================================================
+
+        f.write(
+            f"\nTotal Time for "
+            f"NUM_SERVERS={NUM_SERVERS}: "
+            f"{elapsed_total:.2f}s\n"
+        )
+
+        # =====================================================
+        # METHODOLOGICAL NOTE
+        # =====================================================
+
+        f.write(
+            "\nFLOP definition:\n"
+        )
+
+        f.write(
+            "The analytical FLOP count represents "
+            "floating-point arithmetic operations "
+            "executed by the GA optimization logic.\n"
+        )
+
+        f.write(
+            "OMNeT++ simulation computation, "
+            "random-number generation, comparisons, "
+            "assignments, sorting, I/O, and "
+            "process-launch overhead are excluded "
+            "from the analytical FLOP count.\n"
+        )
+
+        f.write(
+            "Measured execution time includes the "
+            "complete simulation-driven optimization "
+            "process, including OMNeT++ execution "
+            "and Python/process overhead.\n"
+        )
+
+        # =====================================================
+        # CONVERGENCE METHODOLOGICAL NOTE
+        # =====================================================
+
+        f.write(
+            "\nConvergence recording:\n"
+        )
+
+        f.write(
+            "Invalid solutions represent the number "
+            "of population candidates that failed "
+            "the hard 100% coverage constraint "
+            "during each generation.\n"
+        )
+
+        f.write(
+            "Average fitness represents the mean SP "
+            "of valid candidate solutions in each "
+            "generation.\n"
+        )
+
+        f.write(
+            "Best fitness represents the maximum SP "
+            "among valid candidate solutions in each "
+            "generation.\n"
+        )
+
+    print(
+        f"NUM_SERVERS={NUM_SERVERS}: "
+        f"Total GA FLOPs={flops.total}, "
+        f"Total Time={elapsed_total:.2f}s"
+    )

@@ -1,0 +1,3248 @@
+
+import subprocess
+import sys
+import re
+import math
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from scipy.stats import (
+    wilcoxon,
+    ttest_rel,
+    t,
+)
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+scripts = [
+    "GAwithPenalty.py",
+    "ACORwithPenalty.py",
+    "PSOwithPenalty.py",
+    "SAwithPenalty.py"
+]
+
+RUNS_PER_SCRIPT = 20
+
+BASE_OUTPUT_DIR = Path(
+    r"D:\Alaa\Results\Optimizer"
+)
+
+STATISTICAL_ANALYSIS_DIR = (
+    BASE_OUTPUT_DIR / "Statistical_Analysis"
+)
+
+
+# ============================================================
+# SEED CONFIGURATION
+# ============================================================
+
+SEED_BASE = 20260820000
+
+
+def get_seed(run_number):
+
+    return SEED_BASE + run_number
+
+
+# ============================================================
+# UPS WEIGHT CONFIGURATIONS
+# ============================================================
+
+WEIGHT_CONFIGS = {
+
+    "Balanced": {
+        "SP": 1 / 3,
+        "Runtime": 1 / 3,
+        "FLOPs": 1 / 3,
+    },
+
+    "Optimization_Performance": {
+        "SP": 0.6,
+        "Runtime": 0.2,
+        "FLOPs": 0.2,
+    },
+
+    "Computational_Oriented": {
+        "SP": 0.2,
+        "Runtime": 0.4,
+        "FLOPs": 0.4,
+    },
+}
+
+
+WEIGHT_ORDER = [
+    "Balanced",
+    "Computational_Oriented",
+    "Optimization_Performance",
+]
+
+
+# ============================================================
+# RUN ALGORITHM
+# ============================================================
+
+def run_algorithm(script):
+
+    algo_name = Path(script).stem
+
+    algo_dir = (
+        BASE_OUTPUT_DIR / algo_name
+    )
+
+    algo_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    print("\n" + "=" * 70)
+    print(f"STARTING {algo_name}")
+    print(f"TOTAL RUNS: {RUNS_PER_SCRIPT}")
+    print("=" * 70)
+
+    completed_runs = 0
+
+    for run in range(
+        1,
+        RUNS_PER_SCRIPT + 1
+    ):
+
+        run_dir = (
+            algo_dir /
+            f"{algo_name}{run}"
+        )
+
+        run_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        seed = get_seed(run)
+
+        print()
+        print("-" * 70)
+        print(
+            f"[{algo_name}] "
+            f"Run {run}/{RUNS_PER_SCRIPT} "
+            f"| Seed = {seed}"
+        )
+        print("-" * 70)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                script,
+                str(seed),
+                str(run_dir)
+            ]
+        )
+
+        if result.returncode != 0:
+
+            print(
+                f"\nERROR: {script} failed "
+                f"on run {run}."
+            )
+
+            print(
+                "Stopping this algorithm."
+            )
+
+            break
+
+        completed_runs += 1
+
+        print(
+            f"[{algo_name}] "
+            f"Run {run} completed successfully."
+        )
+
+    print(
+        f"\n{algo_name}: "
+        f"{completed_runs}/{RUNS_PER_SCRIPT} "
+        f"runs completed."
+    )
+
+
+# ============================================================
+# DYNAMIC SERVER LOG DISCOVERY
+# ============================================================
+
+def discover_server_logs(run_dir):
+
+    discovered = []
+
+    pattern = re.compile(
+        r"^(\d+)_Servers\.txt$",
+        re.IGNORECASE
+    )
+
+    if not run_dir.exists():
+        return discovered
+
+    for file_path in run_dir.iterdir():
+
+        if not file_path.is_file():
+            continue
+
+        match = pattern.match(
+            file_path.name
+        )
+
+        if not match:
+            continue
+
+        server_count = int(
+            match.group(1)
+        )
+
+        discovered.append(
+            (
+                server_count,
+                file_path
+            )
+        )
+
+    discovered.sort(
+        key=lambda x: x[0]
+    )
+
+    return discovered
+
+
+# ============================================================
+# PARSE GENERATION CONVERGENCE
+#
+# IMPORTANT:
+#
+# The GA/ACOR output does NOT explicitly print:
+#
+# Average Coverage:
+# Best Coverage:
+#
+# Therefore we calculate them from the Scenario blocks.
+#
+# AverageCoverage:
+#     Mean C across VALID scenarios in the generation.
+#
+# BestCoverage:
+#     C belonging to the scenario with the highest
+#     Fitness in that generation.
+#
+# Invalid scenarios:
+#     "Invalid scenario (coverage < 0.85)."
+#     These are counted in InvalidSolutions and excluded
+#     from AverageCoverage.
+# ============================================================
+
+def parse_generation_convergence(
+    text,
+    algorithm,
+    run_number,
+    seed,
+    server_count
+):
+
+    convergence = []
+
+    generation_pattern = re.compile(
+        r"===== Generation\s+(\d+)\s+====="
+    )
+
+    generation_matches = list(
+        generation_pattern.finditer(text)
+    )
+
+    # --------------------------------------------------------
+    # Scenario pattern
+    # --------------------------------------------------------
+
+    scenario_pattern = re.compile(
+        r"Scenario\s+(\d+):"
+    )
+
+    # --------------------------------------------------------
+    # Fitness / coverage pattern
+    #
+    # Example:
+    #
+    # SR=7.792330, SP=0.948098, C=0.994800,
+    # Fit=0.943168
+    # --------------------------------------------------------
+
+    result_pattern = re.compile(
+        r"SR\s*=\s*([0-9eE+\-.]+),\s*"
+        r"SP\s*=\s*([0-9eE+\-.]+),\s*"
+        r"C\s*=\s*([0-9eE+\-.]+),\s*"
+        r"Fit\s*=\s*([0-9eE+\-.]+)"
+    )
+
+    for gen_index, generation_match in enumerate(
+        generation_matches
+    ):
+
+        generation = int(
+            generation_match.group(1)
+        )
+
+        # ----------------------------------------------------
+        # Determine generation text block
+        # ----------------------------------------------------
+
+        start = generation_match.end()
+
+        if gen_index + 1 < len(
+            generation_matches
+        ):
+
+            end = generation_matches[
+                gen_index + 1
+            ].start()
+
+        else:
+
+            # Only use text before the convergence summary
+            # if this is the final generation.
+            convergence_marker = text.find(
+                "--- Generation Convergence ---",
+                start
+            )
+
+            if convergence_marker != -1:
+                end = convergence_marker
+            else:
+                end = len(text)
+
+        generation_text = text[
+            start:end
+        ]
+
+        # ----------------------------------------------------
+        # Find scenarios
+        # ----------------------------------------------------
+
+        scenarios = list(
+            scenario_pattern.finditer(
+                generation_text
+            )
+        )
+
+        invalid_count = 0
+
+        valid_coverages = []
+
+        valid_results = []
+
+        for scenario_index, scenario_match in enumerate(
+            scenarios
+        ):
+
+            scenario_start = (
+                scenario_match.end()
+            )
+
+            if scenario_index + 1 < len(
+                scenarios
+            ):
+
+                scenario_end = scenarios[
+                    scenario_index + 1
+                ].start()
+
+            else:
+
+                scenario_end = len(
+                    generation_text
+                )
+
+            scenario_text = generation_text[
+                scenario_start:
+                scenario_end
+            ]
+
+            # ------------------------------------------------
+            # Invalid scenario
+            # ------------------------------------------------
+
+            if re.search(
+                r"Invalid scenario\s*"
+                r"\(coverage\s*<\s*0\.85\)",
+                scenario_text,
+                re.IGNORECASE
+            ):
+
+                invalid_count += 1
+
+                continue
+
+            # ------------------------------------------------
+            # Valid scenario
+            # ------------------------------------------------
+
+            result_match = result_pattern.search(
+                scenario_text
+            )
+
+            if not result_match:
+                continue
+
+            sr = float(
+                result_match.group(1)
+            )
+
+            sp = float(
+                result_match.group(2)
+            )
+
+            coverage = float(
+                result_match.group(3)
+            )
+
+            fitness = float(
+                result_match.group(4)
+            )
+
+            valid_coverages.append(
+                coverage
+            )
+
+            valid_results.append({
+
+                "SR": sr,
+
+                "SP": sp,
+
+                "Coverage":
+                    coverage,
+
+                "Fitness":
+                    fitness,
+            })
+
+        # ----------------------------------------------------
+        # Calculate Average Coverage
+        # ----------------------------------------------------
+
+        if valid_coverages:
+
+            average_coverage = (
+                float(
+                    np.mean(
+                        valid_coverages
+                    )
+                )
+            )
+
+        else:
+
+            average_coverage = np.nan
+
+        # ----------------------------------------------------
+        # Calculate Best Fitness
+        # and associated Best Coverage
+        # ----------------------------------------------------
+
+        if valid_results:
+
+            best_result = max(
+                valid_results,
+                key=lambda x: x["Fitness"]
+            )
+
+            best_fitness = (
+                best_result["Fitness"]
+            )
+
+            best_coverage = (
+                best_result["Coverage"]
+            )
+
+            average_fitness = (
+                float(
+                    np.mean([
+                        x["Fitness"]
+                        for x in valid_results
+                    ])
+                )
+            )
+
+        else:
+
+            average_fitness = np.nan
+            best_fitness = np.nan
+            best_coverage = np.nan
+
+        # ----------------------------------------------------
+        # Store convergence row
+        # ----------------------------------------------------
+
+        convergence.append({
+
+            "Servers":
+                server_count,
+
+            "Algorithm":
+                algorithm,
+
+            "Run":
+                run_number,
+
+            "Seed":
+                seed,
+
+            "Generation":
+                generation,
+
+            "InvalidSolutions":
+                invalid_count,
+
+            "AverageFitness":
+                average_fitness,
+
+            "BestFitness":
+                best_fitness,
+
+            "AverageCoverage":
+                average_coverage,
+
+            "BestCoverage":
+                best_coverage,
+        })
+
+    return convergence
+
+
+# ============================================================
+# PARSE ONE RUN LOG
+# ============================================================
+
+def parse_run_log(
+    log_file,
+    algorithm,
+    run_number,
+    seed,
+    server_count
+):
+
+    text = log_file.read_text(
+        encoding="utf-8",
+        errors="ignore"
+    )
+
+    # ========================================================
+    # BEST OVERALL RESULT
+    #
+    # Supports:
+    #
+    # Fitness (SP*C)
+    #
+    # Fitness (SP * C)
+    # ========================================================
+
+    best_match = re.search(
+        r"Fitness \(SP\s*\*\s*C\):\s*"
+        r"([0-9eE+\-.]+),\s*"
+        r"SR:\s*([0-9eE+\-.]+),\s*"
+        r"SP:\s*([0-9eE+\-.]+),\s*"
+        r"C:\s*([0-9eE+\-.]+)",
+        text
+    )
+
+    if best_match:
+
+        best_fit = float(
+            best_match.group(1)
+        )
+
+        best_sr = float(
+            best_match.group(2)
+        )
+
+        best_sp = float(
+            best_match.group(3)
+        )
+
+        best_coverage = float(
+            best_match.group(4)
+        )
+
+    else:
+
+        # ----------------------------------------------------
+        # Older format
+        # ----------------------------------------------------
+
+        old_best_match = re.search(
+            r"Fit \(SP\):\s*"
+            r"([0-9eE+\-.]+),\s*"
+            r"SR:\s*([0-9eE+\-.]+),\s*"
+            r"SP:\s*([0-9eE+\-.]+)",
+            text
+        )
+
+        if old_best_match:
+
+            best_fit = float(
+                old_best_match.group(1)
+            )
+
+            best_sr = float(
+                old_best_match.group(2)
+            )
+
+            best_sp = float(
+                old_best_match.group(3)
+            )
+
+            best_coverage = np.nan
+
+        else:
+
+            best_fit = np.nan
+            best_sr = np.nan
+            best_sp = np.nan
+            best_coverage = np.nan
+
+    # ========================================================
+    # TOTAL FLOPS
+    # ========================================================
+
+    flops_match = re.search(
+        r"TOTAL (?:GA|ACOR|PSO|SA) FLOPs:\s*(\d+)",
+        text
+    )
+
+    total_flops = (
+        int(flops_match.group(1))
+        if flops_match
+        else np.nan
+    )
+
+    # ========================================================
+    # RUNTIME
+    # ========================================================
+
+    time_match = re.search(
+        r"Total Time for "
+        r"NUM_SERVERS=\d+:\s*"
+        r"([0-9eE+\-.]+)s",
+        text
+    )
+
+    runtime = (
+        float(time_match.group(1))
+        if time_match
+        else np.nan
+    )
+
+    # ========================================================
+    # CONVERGENCE
+    #
+    # IMPORTANT:
+    #
+    # This is now calculated directly from the Scenario
+    # blocks rather than looking for a four-number CSV-like
+    # line.
+    # ========================================================
+
+    convergence = parse_generation_convergence(
+        text,
+        algorithm,
+        run_number,
+        seed,
+        server_count
+    )
+
+    return {
+
+        "Servers":
+            server_count,
+
+        "Algorithm":
+            algorithm,
+
+        "Run":
+            run_number,
+
+        "Seed":
+            seed,
+
+        "SP":
+            best_sp,
+
+        "SR":
+            best_sr,
+
+        "Coverage":
+            best_coverage,
+
+        "Fitness":
+            best_fit,
+
+        "Runtime_s":
+            runtime,
+
+        "FLOPs":
+            total_flops,
+
+        "Convergence":
+            convergence,
+    }
+
+
+# ============================================================
+# GATEWAY + SF DISTRIBUTION
+# ============================================================
+
+def parse_gateway_sf_distribution(
+    log_file,
+    algorithm,
+    run_number,
+    server_count
+):
+
+    text = log_file.read_text(
+        encoding="utf-8",
+        errors="ignore"
+    )
+
+    rows = []
+
+    generation_re = re.compile(
+        r"===== Generation\s+(\d+)\s+====="
+    )
+
+    scenario_re = re.compile(
+        r"Scenario\s+(\d+):"
+    )
+
+    sf_re = re.compile(
+        r"Server\[(\d+)\]:\s*"
+        r"SF7=(\d+),\s*"
+        r"SF8=(\d+),\s*"
+        r"SF9=(\d+),\s*"
+        r"SF10=(\d+),\s*"
+        r"SF11=(\d+),\s*"
+        r"SF12=(\d+)"
+    )
+
+    gateway_re = re.compile(
+        r"Server\[(\d+)\]:\s*(\d+)"
+    )
+
+    generations = list(
+        generation_re.finditer(text)
+    )
+
+    print(
+        f"    Generations found: "
+        f"{len(generations)}"
+    )
+
+    for gen_index, gen_match in enumerate(
+        generations
+    ):
+
+        generation = int(
+            gen_match.group(1)
+        )
+
+        start = gen_match.end()
+
+        if gen_index + 1 < len(generations):
+
+            end = generations[
+                gen_index + 1
+            ].start()
+
+        else:
+
+            convergence_marker = text.find(
+                "--- Generation Convergence ---",
+                start
+            )
+
+            if convergence_marker != -1:
+                end = convergence_marker
+            else:
+                end = len(text)
+
+        generation_text = text[
+            start:end
+        ]
+
+        scenarios = list(
+            scenario_re.finditer(
+                generation_text
+            )
+        )
+
+        print(
+            f"      Generation {generation}: "
+            f"{len(scenarios)} scenarios"
+        )
+
+        for scenario_index, scenario_match in enumerate(
+            scenarios
+        ):
+
+            scenario_start = (
+                scenario_match.end()
+            )
+
+            if scenario_index + 1 < len(
+                scenarios
+            ):
+
+                scenario_end = scenarios[
+                    scenario_index + 1
+                ].start()
+
+            else:
+
+                scenario_end = len(
+                    generation_text
+                )
+
+            scenario_text = generation_text[
+                scenario_start:
+                scenario_end
+            ]
+
+            if (
+                "SF distribution by gateway:"
+                not in scenario_text
+            ):
+                continue
+
+            if (
+                "Gateway connected hosts:"
+                not in scenario_text
+            ):
+                continue
+
+            # =================================================
+            # SF DISTRIBUTION
+            # =================================================
+
+            sf_section = scenario_text.split(
+                "SF distribution by gateway:",
+                1
+            )[1]
+
+            if (
+                "Gateway connected hosts:"
+                in sf_section
+            ):
+
+                sf_section = sf_section.split(
+                    "Gateway connected hosts:",
+                    1
+                )[0]
+
+            sf_matches = sf_re.findall(
+                sf_section
+            )
+
+            sf_data = {}
+
+            for match in sf_matches:
+
+                gateway = (
+                    int(match[0]) + 1
+                )
+
+                sf_data[gateway] = {
+
+                    "SF7":
+                        int(match[1]),
+
+                    "SF8":
+                        int(match[2]),
+
+                    "SF9":
+                        int(match[3]),
+
+                    "SF10":
+                        int(match[4]),
+
+                    "SF11":
+                        int(match[5]),
+
+                    "SF12":
+                        int(match[6]),
+                }
+
+            # =================================================
+            # GATEWAY CONNECTED HOSTS
+            # =================================================
+
+            gateway_section = scenario_text.split(
+                "Gateway connected hosts:",
+                1
+            )[1]
+
+            if (
+                "Uncovered hosts:"
+                in gateway_section
+            ):
+
+                gateway_section = gateway_section.split(
+                    "Uncovered hosts:",
+                    1
+                )[0]
+
+            gateway_matches = gateway_re.findall(
+                gateway_section
+            )
+
+            gateway_data = {}
+
+            for match in gateway_matches:
+
+                gateway = (
+                    int(match[0]) + 1
+                )
+
+                connected_hosts = int(
+                    match[1]
+                )
+
+                gateway_data[gateway] = (
+                    connected_hosts
+                )
+
+            # =================================================
+            # COMBINE
+            # =================================================
+
+            for gateway in sorted(
+                sf_data
+            ):
+
+                if gateway not in gateway_data:
+                    continue
+
+                rows.append({
+
+                    "Number of Gateways":
+                        server_count,
+
+                    "Algorithm":
+                        algorithm,
+
+                    "Gateway":
+                        gateway,
+
+                    "Run":
+                        run_number,
+
+                    "Gen":
+                        generation,
+
+                    "No_of_Connected_Hosts":
+                        gateway_data[gateway],
+
+                    "SF7":
+                        sf_data[gateway]["SF7"],
+
+                    "SF8":
+                        sf_data[gateway]["SF8"],
+
+                    "SF9":
+                        sf_data[gateway]["SF9"],
+
+                    "SF10":
+                        sf_data[gateway]["SF10"],
+
+                    "SF11":
+                        sf_data[gateway]["SF11"],
+
+                    "SF12":
+                        sf_data[gateway]["SF12"],
+                })
+
+    return rows
+
+
+# ============================================================
+# COLLECT ALL RESULTS
+# ============================================================
+
+def collect_results():
+
+    all_results = []
+
+    convergence_results = []
+
+    gateway_sf_results = []
+
+    for script in scripts:
+
+        algorithm = Path(script).stem
+
+        algo_dir = (
+            BASE_OUTPUT_DIR / algorithm
+        )
+
+        if not algo_dir.exists():
+
+            print(
+                f"\nWARNING: Algorithm directory "
+                f"does not exist:\n{algo_dir}"
+            )
+
+            continue
+
+        for run in range(
+            1,
+            RUNS_PER_SCRIPT + 1
+        ):
+
+            seed = get_seed(run)
+
+            run_dir = (
+                algo_dir /
+                f"{algorithm}{run}"
+            )
+
+            if not run_dir.exists():
+
+                print(
+                    f"\nWARNING: Missing run directory:"
+                    f"\n{run_dir}"
+                )
+
+                continue
+
+            discovered_logs = (
+                discover_server_logs(
+                    run_dir
+                )
+            )
+
+            if not discovered_logs:
+
+                print(
+                    f"\nWARNING: No server logs found "
+                    f"in:\n{run_dir}"
+                )
+
+                continue
+
+            print()
+
+            print(
+                f"{algorithm}{run}: "
+                f"Found server configurations: "
+                f"{[x[0] for x in discovered_logs]}"
+            )
+
+            for (
+                server_count,
+                log_file
+            ) in discovered_logs:
+
+                print(
+                    f"Parsing "
+                    f"{algorithm}{run} -> "
+                    f"{server_count}_Servers.txt"
+                )
+
+                result = parse_run_log(
+                    log_file,
+                    algorithm,
+                    run,
+                    seed,
+                    server_count
+                )
+
+                all_results.append({
+
+                    "Servers":
+                        result["Servers"],
+
+                    "Algorithm":
+                        result["Algorithm"],
+
+                    "Run":
+                        result["Run"],
+
+                    "Seed":
+                        result["Seed"],
+
+                    "SP":
+                        result["SP"],
+
+                    "SR":
+                        result["SR"],
+
+                    "Coverage":
+                        result["Coverage"],
+
+                    "Fitness":
+                        result["Fitness"],
+
+                    "Runtime_s":
+                        result["Runtime_s"],
+
+                    "FLOPs":
+                        result["FLOPs"],
+                })
+
+                convergence_results.extend(
+                    result["Convergence"]
+                )
+
+                gateway_rows = (
+                    parse_gateway_sf_distribution(
+                        log_file,
+                        algorithm,
+                        run,
+                        server_count
+                    )
+                )
+
+                gateway_sf_results.extend(
+                    gateway_rows
+                )
+
+    results_df = pd.DataFrame(
+        all_results
+    )
+
+    convergence_df = pd.DataFrame(
+        convergence_results
+    )
+
+    gateway_sf_df = pd.DataFrame(
+        gateway_sf_results
+    )
+
+    # ========================================================
+    # FORCE EXACT COLUMN ORDER
+    # ========================================================
+
+    if not results_df.empty:
+
+        results_df = results_df[
+            [
+                "Servers",
+                "Algorithm",
+                "Run",
+                "Seed",
+                "SP",
+                "SR",
+                "Coverage",
+                "Fitness",
+                "Runtime_s",
+                "FLOPs",
+            ]
+        ]
+
+        results_df = results_df.sort_values(
+            by=[
+                "Servers",
+                "Algorithm",
+                "Run"
+            ]
+        ).reset_index(
+            drop=True
+        )
+
+    if not convergence_df.empty:
+
+        convergence_df = convergence_df[
+            [
+                "Servers",
+                "Algorithm",
+                "Run",
+                "Seed",
+                "Generation",
+                "InvalidSolutions",
+                "AverageFitness",
+                "BestFitness",
+                "AverageCoverage",
+                "BestCoverage",
+            ]
+        ]
+
+        convergence_df = convergence_df.sort_values(
+            by=[
+                "Servers",
+                "Algorithm",
+                "Run",
+                "Generation"
+            ]
+        ).reset_index(
+            drop=True
+        )
+
+    if not gateway_sf_df.empty:
+
+        gateway_sf_df = gateway_sf_df[
+            [
+                "Number of Gateways",
+                "Algorithm",
+                "Gateway",
+                "Run",
+                "Gen",
+                "No_of_Connected_Hosts",
+                "SF7",
+                "SF8",
+                "SF9",
+                "SF10",
+                "SF11",
+                "SF12",
+            ]
+        ]
+
+        gateway_sf_df = gateway_sf_df.sort_values(
+            by=[
+                "Number of Gateways",
+                "Algorithm",
+                "Run",
+                "Gen",
+                "Gateway"
+            ]
+        ).reset_index(
+            drop=True
+        )
+
+    return (
+        results_df,
+        convergence_df,
+        gateway_sf_df
+    )
+
+
+# ============================================================
+# APPEND / UPDATE CSV
+# ============================================================
+
+def append_or_update_csv(
+    new_df,
+    csv_path,
+    key_columns,
+    sort_columns=None
+):
+
+    if new_df.empty:
+
+        print(
+            f"No new data for:\n{csv_path}"
+        )
+
+        return
+
+    csv_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # ========================================================
+    # NEW CSV
+    # ========================================================
+
+    if not csv_path.exists():
+
+        output_df = new_df.copy()
+
+        if sort_columns:
+
+            output_df = output_df.sort_values(
+                by=sort_columns
+            ).reset_index(
+                drop=True
+            )
+
+        output_df.to_csv(
+            csv_path,
+            index=False
+        )
+
+        print(
+            f"Created:\n{csv_path}"
+        )
+
+        return
+
+    # ========================================================
+    # EXISTING CSV
+    # ========================================================
+
+    try:
+
+        old_df = pd.read_csv(
+            csv_path
+        )
+
+    except Exception as e:
+
+        print(
+            f"WARNING: Could not read "
+            f"{csv_path}"
+        )
+
+        print(e)
+
+        print(
+            "Replacing corrupted CSV."
+        )
+
+        new_df.to_csv(
+            csv_path,
+            index=False
+        )
+
+        return
+
+    # ========================================================
+    # ENSURE NEW COLUMNS EXIST
+    # ========================================================
+
+    for column in new_df.columns:
+
+        if column not in old_df.columns:
+
+            old_df[column] = np.nan
+
+    # ========================================================
+    # REMOVE OLD ROWS WITH SAME KEYS
+    # ========================================================
+
+    if all(
+        column in old_df.columns
+        for column in key_columns
+    ):
+
+        new_keys = new_df[
+            key_columns
+        ].drop_duplicates()
+
+        old_df = old_df.merge(
+            new_keys.assign(
+                _remove_duplicate=1
+            ),
+            on=key_columns,
+            how="left"
+        )
+
+        old_df = old_df[
+            old_df[
+                "_remove_duplicate"
+            ].isna()
+        ]
+
+        old_df = old_df.drop(
+            columns=[
+                "_remove_duplicate"
+            ]
+        )
+
+    # ========================================================
+    # ENSURE COLUMN COMPATIBILITY
+    # ========================================================
+
+    for column in old_df.columns:
+
+        if column not in new_df.columns:
+
+            new_df[column] = np.nan
+
+    for column in new_df.columns:
+
+        if column not in old_df.columns:
+
+            old_df[column] = np.nan
+
+    new_df = new_df[
+        old_df.columns
+    ]
+
+    # ========================================================
+    # COMBINE
+    # ========================================================
+
+    combined_df = pd.concat(
+        [
+            old_df,
+            new_df
+        ],
+        ignore_index=True
+    )
+
+    # ========================================================
+    # DUPLICATE PROTECTION
+    # ========================================================
+
+    combined_df = combined_df.drop_duplicates(
+        subset=key_columns,
+        keep="last"
+    )
+
+    # ========================================================
+    # SORT
+    # ========================================================
+
+    if sort_columns:
+
+        combined_df = combined_df.sort_values(
+            by=sort_columns
+        ).reset_index(
+            drop=True
+        )
+
+    combined_df.to_csv(
+        csv_path,
+        index=False
+    )
+
+    print(
+        f"Updated:\n{csv_path}"
+    )
+
+
+# ============================================================
+# DESCRIPTIVE STATISTICS
+# ============================================================
+
+def calculate_descriptive_statistics(df):
+
+    rows = []
+
+    for (
+        algorithm,
+        servers
+    ), group in df.groupby(
+        [
+            "Algorithm",
+            "Servers"
+        ]
+    ):
+
+        for metric in [
+            "SP",
+            "SR",
+            "Coverage",
+            "Runtime_s",
+            "FLOPs",
+        ]:
+
+            values = (
+                group[metric]
+                .dropna()
+            )
+
+            if len(values) == 0:
+                continue
+
+            mean = values.mean()
+
+            sd = values.std(
+                ddof=1
+            )
+
+            median = values.median()
+
+            q1 = values.quantile(
+                0.25
+            )
+
+            q3 = values.quantile(
+                0.75
+            )
+
+            iqr = q3 - q1
+
+            n = len(values)
+
+            if n > 1:
+
+                se = (
+                    sd /
+                    math.sqrt(n)
+                )
+
+                critical = t.ppf(
+                    0.975,
+                    n - 1
+                )
+
+                margin = (
+                    critical * se
+                )
+
+                ci_low = (
+                    mean - margin
+                )
+
+                ci_high = (
+                    mean + margin
+                )
+
+            else:
+
+                ci_low = np.nan
+                ci_high = np.nan
+
+            rows.append({
+
+                "Algorithm":
+                    algorithm,
+
+                "Number of Gateways":
+                    servers,
+
+                "Metric":
+                    metric,
+
+                "N":
+                    n,
+
+                "Mean":
+                    mean,
+
+                "SD":
+                    sd,
+
+                "Median":
+                    median,
+
+                "Q1":
+                    q1,
+
+                "Q3":
+                    q3,
+
+                "IQR":
+                    iqr,
+
+                "95% CI Lower":
+                    ci_low,
+
+                "95% CI Upper":
+                    ci_high,
+            })
+
+    result = pd.DataFrame(
+        rows
+    )
+
+    if not result.empty:
+
+        result = result[
+            [
+                "Algorithm",
+                "Number of Gateways",
+                "Metric",
+                "N",
+                "Mean",
+                "SD",
+                "Median",
+                "Q1",
+                "Q3",
+                "IQR",
+                "95% CI Lower",
+                "95% CI Upper",
+            ]
+        ]
+
+        result = result.sort_values(
+            by=[
+                "Number of Gateways",
+                "Algorithm",
+                "Metric"
+            ]
+        ).reset_index(
+            drop=True
+        )
+
+    return result
+
+
+# ============================================================
+# HOLM CORRECTION
+# ============================================================
+
+def holm_correction(
+    p_values
+):
+
+    p_values = np.asarray(
+        p_values,
+        dtype=float
+    )
+
+    adjusted = np.full(
+        len(p_values),
+        np.nan
+    )
+
+    valid_indices = [
+        i
+        for i, p in enumerate(p_values)
+        if np.isfinite(p)
+    ]
+
+    if not valid_indices:
+        return adjusted
+
+    sorted_indices = sorted(
+        valid_indices,
+        key=lambda i: p_values[i]
+    )
+
+    previous = 0.0
+
+    m = len(
+        sorted_indices
+    )
+
+    for rank, index in enumerate(
+        sorted_indices
+    ):
+
+        adjustment = (
+            (m - rank)
+            * p_values[index]
+        )
+
+        adjustment = max(
+            adjustment,
+            previous
+        )
+
+        adjustment = min(
+            adjustment,
+            1.0
+        )
+
+        adjusted[index] = (
+            adjustment
+        )
+
+        previous = adjustment
+
+    return adjusted
+
+
+# ============================================================
+# PAIRWISE STATISTICAL TESTS
+# ============================================================
+
+def pairwise_statistics(df):
+
+    algorithms = sorted(
+        df["Algorithm"]
+        .dropna()
+        .unique()
+    )
+
+    if len(algorithms) < 2:
+
+        print(
+            "\nOnly one algorithm is available."
+        )
+
+        return pd.DataFrame()
+
+    rows = []
+
+    server_counts = sorted(
+        df["Servers"]
+        .dropna()
+        .unique()
+    )
+
+    for i in range(
+        len(algorithms)
+    ):
+
+        for j in range(
+            i + 1,
+            len(algorithms)
+        ):
+
+            algo_a = algorithms[i]
+            algo_b = algorithms[j]
+
+            for server_count in server_counts:
+
+                a = df[
+                    (
+                        df["Algorithm"]
+                        == algo_a
+                    )
+                    &
+                    (
+                        df["Servers"]
+                        == server_count
+                    )
+                ]
+
+                b = df[
+                    (
+                        df["Algorithm"]
+                        == algo_b
+                    )
+                    &
+                    (
+                        df["Servers"]
+                        == server_count
+                    )
+                ]
+
+                merged = pd.merge(
+                    a,
+                    b,
+                    on=[
+                        "Run"
+                    ],
+                    suffixes=(
+                        "_A",
+                        "_B"
+                    )
+                )
+
+                for metric in [
+                    "SP",
+                    "SR",
+                    "Coverage",
+                    "Runtime_s",
+                    "FLOPs",
+                ]:
+
+                    x = merged[
+                        f"{metric}_A"
+                    ].to_numpy(
+                        dtype=float
+                    )
+
+                    y = merged[
+                        f"{metric}_B"
+                    ].to_numpy(
+                        dtype=float
+                    )
+
+                    valid = (
+                        np.isfinite(x)
+                        &
+                        np.isfinite(y)
+                    )
+
+                    x = x[valid]
+                    y = y[valid]
+
+                    if len(x) < 2:
+                        continue
+
+                    try:
+
+                        t_stat, t_p = (
+                            ttest_rel(
+                                x,
+                                y
+                            )
+                        )
+
+                    except Exception:
+
+                        t_stat = np.nan
+                        t_p = np.nan
+
+                    try:
+
+                        w_stat, w_p = (
+                            wilcoxon(
+                                x,
+                                y
+                            )
+                        )
+
+                    except ValueError:
+
+                        w_stat = np.nan
+                        w_p = np.nan
+
+                    rows.append({
+
+                        "Algorithm A":
+                            algo_a,
+
+                        "Algorithm B":
+                            algo_b,
+
+                        "Servers":
+                            server_count,
+
+                        "Metric":
+                            metric,
+
+                        "N":
+                            len(x),
+
+                        "Paired t-statistic":
+                            t_stat,
+
+                        "Paired t-test p-value":
+                            t_p,
+
+                        "Wilcoxon statistic":
+                            w_stat,
+
+                        "Wilcoxon p-value":
+                            w_p,
+                    })
+
+    result = pd.DataFrame(
+        rows
+    )
+
+    if result.empty:
+        return result
+
+    result[
+        "t-test Holm Adjusted p-value"
+    ] = np.nan
+
+    result[
+        "Wilcoxon Holm Adjusted p-value"
+    ] = np.nan
+
+    result[
+        "t-test significance"
+    ] = "Not Significant"
+
+    result[
+        "Wilcoxon significance"
+    ] = "Not Significant"
+
+    for metric in result[
+        "Metric"
+    ].unique():
+
+        mask = (
+            result["Metric"]
+            == metric
+        )
+
+        indices = result.index[
+            mask
+        ]
+
+        t_values = result.loc[
+            indices,
+            "Paired t-test p-value"
+        ].to_numpy(
+            dtype=float
+        )
+
+        t_adjusted = holm_correction(
+            t_values
+        )
+
+        result.loc[
+            indices,
+            "t-test Holm Adjusted p-value"
+        ] = t_adjusted
+
+        w_values = result.loc[
+            indices,
+            "Wilcoxon p-value"
+        ].to_numpy(
+            dtype=float
+        )
+
+        w_adjusted = holm_correction(
+            w_values
+        )
+
+        result.loc[
+            indices,
+            "Wilcoxon Holm Adjusted p-value"
+        ] = w_adjusted
+
+    result[
+        "t-test significance"
+    ] = np.where(
+        result[
+            "t-test Holm Adjusted p-value"
+        ] < 0.05,
+        "Significant",
+        "Not Significant"
+    )
+
+    result[
+        "Wilcoxon significance"
+    ] = np.where(
+        result[
+            "Wilcoxon Holm Adjusted p-value"
+        ] < 0.05,
+        "Significant",
+        "Not Significant"
+    )
+
+    result = result.sort_values(
+        by=[
+            "Servers",
+            "Algorithm A",
+            "Algorithm B",
+            "Metric"
+        ]
+    ).reset_index(
+        drop=True
+    )
+
+    return result
+
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+def normalize_metric(
+    values,
+    higher_is_better=True
+):
+
+    values = np.asarray(
+        values,
+        dtype=float
+    )
+
+    if np.all(
+        ~np.isfinite(values)
+    ):
+
+        return np.full_like(
+            values,
+            np.nan
+        )
+
+    min_value = np.nanmin(
+        values
+    )
+
+    max_value = np.nanmax(
+        values
+    )
+
+    if (
+        not np.isfinite(min_value)
+        or
+        not np.isfinite(max_value)
+    ):
+
+        return np.full_like(
+            values,
+            np.nan
+        )
+
+    if max_value == min_value:
+
+        return np.ones_like(
+            values
+        )
+
+    if higher_is_better:
+
+        return (
+            (values - min_value)
+            /
+            (max_value - min_value)
+        )
+
+    return (
+        (max_value - values)
+        /
+        (max_value - min_value)
+    )
+
+
+# ============================================================
+# UNIFIED PERFORMANCE SCORE
+# ============================================================
+
+def calculate_unified_scores(df):
+
+    result = df.copy()
+
+    result[
+        "SP_Normalized"
+    ] = np.nan
+
+    result[
+        "Runtime_Normalized"
+    ] = np.nan
+
+    result[
+        "FLOPs_Normalized"
+    ] = np.nan
+
+    for servers, indices in result.groupby(
+        "Servers"
+    ).groups.items():
+
+        indices = list(
+            indices
+        )
+
+        result.loc[
+            indices,
+            "SP_Normalized"
+        ] = normalize_metric(
+            result.loc[
+                indices,
+                "SP"
+            ],
+            higher_is_better=True
+        )
+
+        result.loc[
+            indices,
+            "Runtime_Normalized"
+        ] = normalize_metric(
+            result.loc[
+                indices,
+                "Runtime_s"
+            ],
+            higher_is_better=False
+        )
+
+        result.loc[
+            indices,
+            "FLOPs_Normalized"
+        ] = normalize_metric(
+            result.loc[
+                indices,
+                "FLOPs"
+            ],
+            higher_is_better=False
+        )
+
+    for (
+        config_name,
+        weights
+    ) in WEIGHT_CONFIGS.items():
+
+        result[
+            f"UPS_{config_name}"
+        ] = (
+
+            weights["SP"]
+            *
+            result["SP_Normalized"]
+
+            +
+
+            weights["Runtime"]
+            *
+            result["Runtime_Normalized"]
+
+            +
+
+            weights["FLOPs"]
+            *
+            result["FLOPs_Normalized"]
+        )
+
+    ranking_rows = []
+
+    for (
+        config_name,
+        weights
+    ) in WEIGHT_CONFIGS.items():
+
+        ranking = (
+            result
+            .groupby(
+                [
+                    "Servers",
+                    "Algorithm"
+                ]
+            )[
+                f"UPS_{config_name}"
+            ]
+            .mean()
+            .reset_index()
+        )
+
+        ranking = ranking.rename(
+            columns={
+                f"UPS_{config_name}":
+                    "Mean UPS"
+            }
+        )
+
+        ranking["Rank"] = (
+            ranking[
+                "Mean UPS"
+            ]
+            .rank(
+                method="min",
+                ascending=False
+            )
+        )
+
+        ranking["Rank"] = (
+            ranking["Rank"]
+            .astype("Int64")
+        )
+
+        ranking[
+            "Weight Configuration"
+        ] = config_name
+
+        for _, row in ranking.iterrows():
+
+            ranking_rows.append({
+
+                "Servers":
+                    int(row["Servers"]),
+
+                "Weight Configuration":
+                    row[
+                        "Weight Configuration"
+                    ],
+
+                "Algorithm":
+                    row["Algorithm"],
+
+                "Mean UPS":
+                    row["Mean UPS"],
+
+                "Rank":
+                    row["Rank"],
+            })
+
+    ranking_df = pd.DataFrame(
+        ranking_rows
+    )
+
+    if not ranking_df.empty:
+
+        ranking_df = ranking_df[
+            [
+                "Servers",
+                "Weight Configuration",
+                "Algorithm",
+                "Mean UPS",
+                "Rank",
+            ]
+        ]
+
+        ranking_df[
+            "_WeightOrder"
+        ] = ranking_df[
+            "Weight Configuration"
+        ].map({
+            name: index
+            for index, name in enumerate(
+                WEIGHT_ORDER
+            )
+        })
+
+        ranking_df = ranking_df.sort_values(
+            by=[
+                "Servers",
+                "_WeightOrder",
+                "Rank",
+                "Algorithm"
+            ]
+        ).drop(
+            columns=[
+                "_WeightOrder"
+            ]
+        ).reset_index(
+            drop=True
+        )
+
+    result = result[
+        [
+            "Servers",
+            "Algorithm",
+            "Run",
+            "Seed",
+
+            "SP",
+            "SR",
+            "Coverage",
+
+            "Fitness",
+            "Runtime_s",
+            "FLOPs",
+
+            "SP_Normalized",
+            "Runtime_Normalized",
+            "FLOPs_Normalized",
+
+            "UPS_Balanced",
+            "UPS_Optimization_Performance",
+            "UPS_Computational_Oriented",
+        ]
+    ]
+
+    result = result.sort_values(
+        by=[
+            "Servers",
+            "Algorithm",
+            "Run"
+        ]
+    ).reset_index(
+        drop=True
+    )
+
+    return (
+        result,
+        ranking_df
+    )
+
+
+# ============================================================
+# CONVERGENCE PLOTS
+# ============================================================
+
+def generate_convergence_plots(
+    convergence_df
+):
+
+    if convergence_df.empty:
+
+        print(
+            "No convergence data available."
+        )
+
+        return
+
+    plots_dir = (
+        STATISTICAL_ANALYSIS_DIR
+        / "Convergence"
+    )
+
+    plots_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    for (
+        algorithm,
+        servers
+    ), data in convergence_df.groupby(
+        [
+            "Algorithm",
+            "Servers"
+        ]
+    ):
+
+        grouped = (
+            data
+            .groupby(
+                "Generation"
+            )
+            .agg(
+
+                InvalidSolutions_Mean=(
+                    "InvalidSolutions",
+                    "mean"
+                ),
+
+                InvalidSolutions_SD=(
+                    "InvalidSolutions",
+                    "std"
+                ),
+
+                AverageFitness_Mean=(
+                    "AverageFitness",
+                    "mean"
+                ),
+
+                AverageFitness_SD=(
+                    "AverageFitness",
+                    "std"
+                ),
+
+                BestFitness_Mean=(
+                    "BestFitness",
+                    "mean"
+                ),
+
+                BestFitness_SD=(
+                    "BestFitness",
+                    "std"
+                ),
+
+                AverageCoverage_Mean=(
+                    "AverageCoverage",
+                    "mean"
+                ),
+
+                AverageCoverage_SD=(
+                    "AverageCoverage",
+                    "std"
+                ),
+
+                BestCoverage_Mean=(
+                    "BestCoverage",
+                    "mean"
+                ),
+
+                BestCoverage_SD=(
+                    "BestCoverage",
+                    "std"
+                ),
+            )
+            .reset_index()
+        )
+
+        # ====================================================
+        # PLOT 1 - INVALID SOLUTIONS
+        # ====================================================
+
+        plt.figure()
+
+        plt.plot(
+            grouped["Generation"],
+            grouped[
+                "InvalidSolutions_Mean"
+            ],
+            linewidth=2
+        )
+
+        plt.fill_between(
+            grouped["Generation"],
+            (
+                grouped[
+                    "InvalidSolutions_Mean"
+                ]
+                -
+                grouped[
+                    "InvalidSolutions_SD"
+                ]
+            ),
+            (
+                grouped[
+                    "InvalidSolutions_Mean"
+                ]
+                +
+                grouped[
+                    "InvalidSolutions_SD"
+                ]
+            ),
+            alpha=0.2
+        )
+
+        plt.xlabel(
+            "Generation"
+        )
+
+        plt.ylabel(
+            "Average Invalid Solutions"
+        )
+
+        plt.title(
+            f"{algorithm} - "
+            f"{servers} Gateways - "
+            f"Average Invalid Solutions ± SD"
+        )
+
+        plt.grid(True)
+        plt.tight_layout()
+
+        plt.savefig(
+            plots_dir /
+            f"{algorithm}_{servers}_Gateways_Average_Invalid_Solutions.png",
+            dpi=300
+        )
+
+        plt.close()
+
+        # ====================================================
+        # PLOT 2 - BEST FITNESS
+        # ====================================================
+
+        plt.figure()
+
+        plt.plot(
+            grouped["Generation"],
+            grouped[
+                "BestFitness_Mean"
+            ],
+            linewidth=2
+        )
+
+        plt.fill_between(
+            grouped["Generation"],
+            (
+                grouped[
+                    "BestFitness_Mean"
+                ]
+                -
+                grouped[
+                    "BestFitness_SD"
+                ]
+            ),
+            (
+                grouped[
+                    "BestFitness_Mean"
+                ]
+                +
+                grouped[
+                    "BestFitness_SD"
+                ]
+            ),
+            alpha=0.2
+        )
+
+        plt.xlabel(
+            "Generation"
+        )
+
+        plt.ylabel(
+            "Best Fitness (SP × C)"
+        )
+
+        plt.title(
+            f"{algorithm} - "
+            f"{servers} Gateways - "
+            f"Average Best Fitness ± SD"
+        )
+
+        plt.grid(True)
+        plt.tight_layout()
+
+        plt.savefig(
+            plots_dir /
+            f"{algorithm}_{servers}_Gateways_Average_Best_Fitness.png",
+            dpi=300
+        )
+
+        plt.close()
+
+        # ====================================================
+        # PLOT 3 - AVERAGE FITNESS
+        # ====================================================
+
+        plt.figure()
+
+        plt.plot(
+            grouped["Generation"],
+            grouped[
+                "AverageFitness_Mean"
+            ],
+            linewidth=2
+        )
+
+        plt.fill_between(
+            grouped["Generation"],
+            (
+                grouped[
+                    "AverageFitness_Mean"
+                ]
+                -
+                grouped[
+                    "AverageFitness_SD"
+                ]
+            ),
+            (
+                grouped[
+                    "AverageFitness_Mean"
+                ]
+                +
+                grouped[
+                    "AverageFitness_SD"
+                ]
+            ),
+            alpha=0.2
+        )
+
+        plt.xlabel(
+            "Generation"
+        )
+
+        plt.ylabel(
+            "Average Fitness (SP × C)"
+        )
+
+        plt.title(
+            f"{algorithm} - "
+            f"{servers} Gateways - "
+            f"Average Fitness ± SD"
+        )
+
+        plt.grid(True)
+        plt.tight_layout()
+
+        plt.savefig(
+            plots_dir /
+            f"{algorithm}_{servers}_Gateways_Average_Fitness.png",
+            dpi=300
+        )
+
+        plt.close()
+
+        # ====================================================
+        # PLOT 4 - AVERAGE COVERAGE
+        # ====================================================
+
+        plt.figure()
+
+        plt.plot(
+            grouped["Generation"],
+            grouped[
+                "AverageCoverage_Mean"
+            ],
+            linewidth=2
+        )
+
+        plt.fill_between(
+            grouped["Generation"],
+            (
+                grouped[
+                    "AverageCoverage_Mean"
+                ]
+                -
+                grouped[
+                    "AverageCoverage_SD"
+                ]
+            ),
+            (
+                grouped[
+                    "AverageCoverage_Mean"
+                ]
+                +
+                grouped[
+                    "AverageCoverage_SD"
+                ]
+            ),
+            alpha=0.2
+        )
+
+        plt.xlabel(
+            "Generation"
+        )
+
+        plt.ylabel(
+            "Average Coverage"
+        )
+
+        plt.title(
+            f"{algorithm} - "
+            f"{servers} Gateways - "
+            f"Average Coverage ± SD"
+        )
+
+        plt.grid(True)
+        plt.tight_layout()
+
+        plt.savefig(
+            plots_dir /
+            f"{algorithm}_{servers}_Gateways_Average_Coverage.png",
+            dpi=300
+        )
+
+        plt.close()
+
+        # ====================================================
+        # PLOT 5 - BEST SOLUTION COVERAGE
+        # ====================================================
+
+        plt.figure()
+
+        plt.plot(
+            grouped["Generation"],
+            grouped[
+                "BestCoverage_Mean"
+            ],
+            linewidth=2
+        )
+
+        plt.fill_between(
+            grouped["Generation"],
+            (
+                grouped[
+                    "BestCoverage_Mean"
+                ]
+                -
+                grouped[
+                    "BestCoverage_SD"
+                ]
+            ),
+            (
+                grouped[
+                    "BestCoverage_Mean"
+                ]
+                +
+                grouped[
+                    "BestCoverage_SD"
+                ]
+            ),
+            alpha=0.2
+        )
+
+        plt.xlabel(
+            "Generation"
+        )
+
+        plt.ylabel(
+            "Best-Solution Coverage"
+        )
+
+        plt.title(
+            f"{algorithm} - "
+            f"{servers} Gateways - "
+            f"Coverage of Best-Fitness Solution ± SD"
+        )
+
+        plt.grid(True)
+        plt.tight_layout()
+
+        plt.savefig(
+            plots_dir /
+            f"{algorithm}_{servers}_Gateways_Best_Coverage.png",
+            dpi=300
+        )
+
+        plt.close()
+
+        # ====================================================
+        # PLOT 6 - INDIVIDUAL RUNS
+        # ====================================================
+
+        plt.figure()
+
+        for (
+            run,
+            run_data
+        ) in data.groupby(
+            "Run"
+        ):
+
+            plt.plot(
+                run_data["Generation"],
+                run_data["BestFitness"],
+                alpha=0.25
+            )
+
+        plt.xlabel(
+            "Generation"
+        )
+
+        plt.ylabel(
+            "Best Fitness (SP × C)"
+        )
+
+        plt.title(
+            f"{algorithm} - "
+            f"{servers} Gateways - "
+            f"{RUNS_PER_SCRIPT} Run Convergence"
+        )
+
+        plt.grid(True)
+        plt.tight_layout()
+
+        plt.savefig(
+            plots_dir /
+            f"{algorithm}_{servers}_Gateways_{RUNS_PER_SCRIPT}_Run_Convergence.png",
+            dpi=300
+        )
+
+        plt.close()
+
+
+# ============================================================
+# PRINT DISCOVERED CONFIGURATIONS
+# ============================================================
+
+def print_discovered_configurations(
+    results_df
+):
+
+    if results_df.empty:
+        return
+
+    print()
+    print("=" * 70)
+
+    print(
+        "DISCOVERED GATEWAY CONFIGURATIONS"
+    )
+
+    print("=" * 70)
+
+    for algorithm in sorted(
+        results_df["Algorithm"].unique()
+    ):
+
+        servers = sorted(
+            results_df[
+                results_df[
+                    "Algorithm"
+                ]
+                == algorithm
+            ][
+                "Servers"
+            ].unique()
+        )
+
+        print(
+            f"{algorithm}: "
+            f"{servers}"
+        )
+
+    print("=" * 70)
+
+
+# ============================================================
+# CSV SCHEMA VALIDATION
+# ============================================================
+
+def validate_dataframe_columns(
+    df,
+    expected_columns,
+    name
+):
+
+    actual = list(
+        df.columns
+    )
+
+    expected = list(
+        expected_columns
+    )
+
+    if actual != expected:
+
+        print()
+
+        print(
+            f"WARNING: {name} column order mismatch."
+        )
+
+        print(
+            "Expected:"
+        )
+
+        print(expected)
+
+        print(
+            "Actual:"
+        )
+
+        print(actual)
+
+        return False
+
+    print(
+        f"{name} schema verified."
+    )
+
+    return True
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print(
+        "\n"
+        "============================================\n"
+        " SIMULATION-DRIVEN OPTIMIZATION RUNNER\n"
+        "============================================\n"
+    )
+
+    # ========================================================
+    # STEP 1
+    # RUN ALGORITHMS
+    # ========================================================
+
+    for script in scripts:
+
+        run_algorithm(
+            script
+        )
+
+    # ========================================================
+    # STEP 2
+    # COLLECT RESULTS
+    # ========================================================
+
+    print(
+        "\nCollecting results..."
+    )
+
+    (
+        results_df,
+        convergence_df,
+        gateway_sf_df
+    ) = collect_results()
+
+    if results_df.empty:
+
+        print(
+            "\nERROR: No results were found."
+        )
+
+        return
+
+    print_discovered_configurations(
+        results_df
+    )
+
+    STATISTICAL_ANALYSIS_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # ========================================================
+    # EXACT CSV SCHEMAS
+    # ========================================================
+
+    expected_results_columns = [
+
+        "Servers",
+        "Algorithm",
+        "Run",
+        "Seed",
+
+        "SP",
+        "SR",
+        "Coverage",
+
+        "Fitness",
+        "Runtime_s",
+        "FLOPs",
+    ]
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # AverageCoverage and BestCoverage are now calculated
+    # directly from every Scenario block in every generation.
+    # --------------------------------------------------------
+
+    expected_convergence_columns = [
+
+        "Servers",
+        "Algorithm",
+        "Run",
+        "Seed",
+        "Generation",
+        "InvalidSolutions",
+        "AverageFitness",
+        "BestFitness",
+        "AverageCoverage",
+        "BestCoverage",
+    ]
+
+    expected_gateway_sf_columns = [
+
+        "Number of Gateways",
+        "Algorithm",
+        "Gateway",
+        "Run",
+        "Gen",
+        "No_of_Connected_Hosts",
+        "SF7",
+        "SF8",
+        "SF9",
+        "SF10",
+        "SF11",
+        "SF12",
+    ]
+
+    # ========================================================
+    # RAW RESULTS
+    # ========================================================
+
+    validate_dataframe_columns(
+        results_df,
+        expected_results_columns,
+        "All_Run_Results"
+    )
+
+    append_or_update_csv(
+
+        results_df,
+
+        STATISTICAL_ANALYSIS_DIR /
+        "All_Run_Results.csv",
+
+        [
+            "Servers",
+            "Algorithm",
+            "Run",
+        ],
+
+        [
+            "Servers",
+            "Algorithm",
+            "Run",
+        ]
+    )
+
+    # ========================================================
+    # CONVERGENCE
+    # ========================================================
+
+    validate_dataframe_columns(
+        convergence_df,
+        expected_convergence_columns,
+        "All_Convergence_Data"
+    )
+
+    append_or_update_csv(
+
+        convergence_df,
+
+        STATISTICAL_ANALYSIS_DIR /
+        "All_Convergence_Data.csv",
+
+        [
+            "Servers",
+            "Algorithm",
+            "Run",
+            "Generation",
+        ],
+
+        [
+            "Servers",
+            "Algorithm",
+            "Run",
+            "Generation",
+        ]
+    )
+
+    # ========================================================
+    # GATEWAY / SF
+    # ========================================================
+
+    validate_dataframe_columns(
+        gateway_sf_df,
+        expected_gateway_sf_columns,
+        "GA_Gateway_SF"
+    )
+
+    append_or_update_csv(
+
+        gateway_sf_df,
+
+        STATISTICAL_ANALYSIS_DIR /
+        "GA_Gateway_SF.csv",
+
+        [
+            "Number of Gateways",
+            "Algorithm",
+            "Gateway",
+            "Run",
+            "Gen",
+        ],
+
+        [
+            "Number of Gateways",
+            "Algorithm",
+            "Run",
+            "Gen",
+            "Gateway",
+        ]
+    )
+
+    print(
+        f"\nGateway/SF rows processed: "
+        f"{len(gateway_sf_df)}"
+    )
+
+    # ========================================================
+    # DESCRIPTIVE STATISTICS
+    # ========================================================
+
+    print(
+        "\nCalculating descriptive statistics..."
+    )
+
+    descriptive_df = (
+        calculate_descriptive_statistics(
+            results_df
+        )
+    )
+
+    expected_descriptive_columns = [
+
+        "Algorithm",
+        "Number of Gateways",
+        "Metric",
+        "N",
+        "Mean",
+        "SD",
+        "Median",
+        "Q1",
+        "Q3",
+        "IQR",
+        "95% CI Lower",
+        "95% CI Upper",
+    ]
+
+    validate_dataframe_columns(
+        descriptive_df,
+        expected_descriptive_columns,
+        "Descriptive_Statistics"
+    )
+
+    append_or_update_csv(
+
+        descriptive_df,
+
+        STATISTICAL_ANALYSIS_DIR /
+        "Descriptive_Statistics.csv",
+
+        [
+            "Algorithm",
+            "Number of Gateways",
+            "Metric",
+        ],
+
+        [
+            "Number of Gateways",
+            "Algorithm",
+            "Metric",
+        ]
+    )
+
+    # ========================================================
+    # PAIRWISE STATISTICS
+    # ========================================================
+
+    print(
+        "\nCalculating statistical tests..."
+    )
+
+    stats_df = pairwise_statistics(
+        results_df
+    )
+
+    if not stats_df.empty:
+
+        append_or_update_csv(
+
+            stats_df,
+
+            STATISTICAL_ANALYSIS_DIR /
+            "Pairwise_Statistical_Tests.csv",
+
+            [
+                "Algorithm A",
+                "Algorithm B",
+                "Servers",
+                "Metric",
+            ],
+
+            [
+                "Servers",
+                "Algorithm A",
+                "Algorithm B",
+                "Metric",
+            ]
+        )
+
+    # ========================================================
+    # UPS
+    # ========================================================
+
+    print(
+        "\nCalculating Unified Performance Scores..."
+    )
+
+    (
+        scored_df,
+        ranking_df
+    ) = calculate_unified_scores(
+        results_df
+    )
+
+    # ========================================================
+    # RUN RESULTS WITH UPS
+    # ========================================================
+
+    expected_ups_columns = [
+
+        "Servers",
+        "Algorithm",
+        "Run",
+        "Seed",
+
+        "SP",
+        "SR",
+        "Coverage",
+        "Fitness",
+
+        "Runtime_s",
+        "FLOPs",
+
+        "SP_Normalized",
+        "Runtime_Normalized",
+        "FLOPs_Normalized",
+
+        "UPS_Balanced",
+        "UPS_Optimization_Performance",
+        "UPS_Computational_Oriented",
+    ]
+
+    validate_dataframe_columns(
+        scored_df,
+        expected_ups_columns,
+        "Run_Results_With_UPS"
+    )
+
+    append_or_update_csv(
+
+        scored_df,
+
+        STATISTICAL_ANALYSIS_DIR /
+        "Run_Results_With_UPS.csv",
+
+        [
+            "Servers",
+            "Algorithm",
+            "Run",
+        ],
+
+        [
+            "Servers",
+            "Algorithm",
+            "Run",
+        ]
+    )
+
+    # ========================================================
+    # ALGORITHM RANKING
+    # ========================================================
+
+    expected_ranking_columns = [
+
+        "Servers",
+        "Weight Configuration",
+        "Algorithm",
+        "Mean UPS",
+        "Rank",
+    ]
+
+    validate_dataframe_columns(
+        ranking_df,
+        expected_ranking_columns,
+        "Algorithm_Ranking_and_Sensitivity"
+    )
+
+    append_or_update_csv(
+
+        ranking_df,
+
+        STATISTICAL_ANALYSIS_DIR /
+        "Algorithm_Ranking_and_Sensitivity.csv",
+
+        [
+            "Servers",
+            "Weight Configuration",
+            "Algorithm",
+        ],
+
+        [
+            "Servers",
+            "Weight Configuration",
+            "Rank",
+            "Algorithm",
+        ]
+    )
+
+    # ========================================================
+    # CONVERGENCE PLOTS
+    # ========================================================
+
+    print(
+        "\nGenerating convergence plots..."
+    )
+
+    generate_convergence_plots(
+        convergence_df
+    )
+
+    # ========================================================
+    # FINAL SUMMARY
+    # ========================================================
+
+    print()
+
+    print("=" * 70)
+
+    print(
+        "ANALYSIS COMPLETE"
+    )
+
+    print("=" * 70)
+
+    print(
+        f"\nResults directory:\n"
+        f"{STATISTICAL_ANALYSIS_DIR}"
+    )
+
+    print(
+        "\nCSV files:"
+    )
+
+    print(
+        "  All_Run_Results.csv"
+    )
+
+    print(
+        "  All_Convergence_Data.csv"
+    )
+
+    print(
+        "  GA_Gateway_SF.csv"
+    )
+
+    print(
+        "  Descriptive_Statistics.csv"
+    )
+
+    print(
+        "  Pairwise_Statistical_Tests.csv"
+    )
+
+    print(
+        "  Run_Results_With_UPS.csv"
+    )
+
+    print(
+        "  Algorithm_Ranking_and_Sensitivity.csv"
+    )
+
+    print(
+        "\nPlots:"
+    )
+
+    print(
+        "  Convergence/"
+    )
+
+    print()
+
+    print(
+        "Gateway configurations were detected "
+        "automatically from *_Servers.txt files."
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
